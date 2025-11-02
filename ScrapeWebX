@@ -1,0 +1,2021 @@
+"""
+High-end async website text extraction + search + crawl + interactive actions (no paid APIs).
+
+Features:
+- Search: DuckDuckGo, Yahoo, Bing, SearXNG
+- Crawl, sitemaps, robots.txt respect, host-level politeness
+- Actions (authorized sites only): click/fill/submit/waits/http_request/evaluate/upload_files
+- Extraction: Readability + fallback; OG/Twitter meta; canonical; raw HTML (opt); outline (H1–H6); tables; JSON-LD; code blocks
+- Files: PDF/DOCX/EPUB/TXT extraction
+- Playwright: headful, device emulation, timezone/locale/geo, screenshots, HAR/trace, downloads
+- Dedupe: off|url|canonical|content; language detection; strip tracking params
+- Output: JSON/JSONL, JSON Schema
+- Terminal screenshot rendering: Kitty graphics, iTerm2 inline, or ASCII fallback
+- Command Dictionary: printable with --print commands or --commands-dict
+
+Information:
+- Only used as modules for scripts
+- Can be used in terminals
+- All commands require query
+
+License:
+  Copyright (c) 2025 AskingAcake
+  Licensed under the NOEDIT‑NOCOM‑NOCLAIM LICENSE 1.0 — see LICENSE.txt
+  No modifications. No commercial use. Do not claim authorship. Use at your own risk.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import dataclasses
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+import base64
+from datetime import datetime, timezone
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urljoin, urlparse, parse_qs, unquote, urlencode, urlunparse
+
+import httpx
+import tldextract
+import urllib.robotparser
+from lxml import html as lxml_html
+from lxml import etree as lxml_etree
+
+# Optional deps
+try:
+    from readability import Document
+    HAVE_READABILITY = True
+except Exception:
+    HAVE_READABILITY = False
+
+try:
+    from bs4 import BeautifulSoup
+    HAVE_BS4 = True
+except Exception:
+    HAVE_BS4 = False
+
+try:
+    from pdfminer.high_level import extract_text as pdf_extract_text
+    HAVE_PDF = True
+except Exception:
+    HAVE_PDF = False
+
+try:
+    import docx  # python-docx
+    HAVE_DOCX = True
+except Exception:
+    HAVE_DOCX = False
+
+try:
+    from ebooklib import epub
+    HAVE_EPUB = True
+except Exception:
+    HAVE_EPUB = False
+
+try:
+    import chardet
+    HAVE_CHARDET = True
+except Exception:
+    HAVE_CHARDET = False
+
+try:
+    from langdetect import detect
+    HAVE_LANGDETECT = True
+except Exception:
+    HAVE_LANGDETECT = False
+
+# Playwright (JS & actions)
+HAVE_PLAYWRIGHT = False
+try:
+    from playwright.async_api import async_playwright
+    HAVE_PLAYWRIGHT = True
+except Exception:
+    HAVE_PLAYWRIGHT = False
+
+# Thumbnails / ASCII rendering
+HAVE_PIL = False
+try:
+    from PIL import Image
+    HAVE_PIL = True
+except Exception:
+    HAVE_PIL = False
+
+# YAML for actions
+HAVE_YAML = False
+try:
+    import yaml
+    HAVE_YAML = True
+except Exception:
+    HAVE_YAML = False
+
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/119.0.0.0 Safari/537.36"
+)
+ALLOWED_SCHEMES = {"http", "https"}
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_name", "utm_id", "gclid", "fbclid", "mc_cid", "mc_eid", "icid",
+    "spm", "ga_source", "ga_campaign", "ga_medium"
+}
+
+# -----------------------------
+# Data models
+# -----------------------------
+@dataclasses.dataclass
+class PageResult:
+    url: str
+    final_url: Optional[str]
+    ok: bool
+    status: Optional[int]
+    title: Optional[str]
+    meta_description: Optional[str]
+    language: Optional[str]
+    extracted_text: Optional[str]
+    word_count: Optional[int]
+    char_count: Optional[int]
+    links: List[str]
+    error: Optional[str]
+    fetched_at: str
+    content_type: Optional[str] = None
+    canonical_url: Optional[str] = None
+    og: Dict[str, str] = dataclasses.field(default_factory=dict)
+    twitter: Dict[str, str] = dataclasses.field(default_factory=dict)
+    raw_html: Optional[str] = None
+    screenshot_path: Optional[str] = None
+    screenshot_b64: Optional[str] = None
+    fetch_ms: Optional[int] = None
+    content_hash: Optional[str] = None
+    # Structured extras
+    outline: List[Dict[str, str]] = dataclasses.field(default_factory=list)
+    tables: List[List[List[str]]] = dataclasses.field(default_factory=list)
+    ld_json: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+    code_blocks: List[str] = dataclasses.field(default_factory=list)
+
+@dataclasses.dataclass
+class OutputEnvelope:
+    mode: str  # "search" or "urls" or "crawl" or "sitemap"
+    engine: Optional[str]
+    query: Optional[str]
+    limit: Optional[int]
+    searched_at: Optional[str]
+    results: List[PageResult]
+
+
+# -----------------------------
+# Utils
+# -----------------------------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def sanitize_text(s: str) -> str:
+    s = re.sub(r'\r\n?', '\n', s)
+    s = re.sub(r'[ \t]+', ' ', s)
+    s = re.sub(r'\n{3,}', '\n\n', s)
+    return s.strip()
+
+def same_reg_domain(url_a: str, url_b: str) -> bool:
+    ta = tldextract.extract(url_a)
+    tb = tldextract.extract(url_b)
+    return (ta.registered_domain and tb.registered_domain and
+            ta.registered_domain == tb.registered_domain)
+
+def absolutize_links(base_url: str, hrefs: List[str]) -> List[str]:
+    out = []
+    for h in hrefs:
+        if not h:
+            continue
+        try:
+            u = urljoin(base_url, h)
+            p = urlparse(u)
+            if p.scheme in ALLOWED_SCHEMES:
+                out.append(u)
+        except Exception:
+            continue
+    # Dedup
+    seen = set()
+    deduped = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            deduped.append(u)
+    return deduped
+
+def strip_tracking_params(u: str) -> str:
+    try:
+        p = urlparse(u)
+        q_pairs = []
+        for k, v in parse_qs(p.query, keep_blank_values=True).items():
+            if k.lower() in TRACKING_PARAMS:
+                continue
+            for vv in v:
+                q_pairs.append((k, vv))
+        new_query = "&".join([f"{k}={vv}" if vv != "" else k for k, vv in q_pairs])
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+    except Exception:
+        return u
+
+def compute_hash(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    h = hashlib.sha256()
+    h.update(text.encode("utf-8"))
+    return h.hexdigest()
+
+
+# -----------------------------
+# Robots + politeness
+# -----------------------------
+class RobotsCache:
+    def __init__(self, user_agent: str):
+        self.user_agent = user_agent
+        self._cache: Dict[str, urllib.robotparser.RobotFileParser] = {}
+        self._lock = asyncio.Lock()
+    async def can_fetch(self, client: httpx.AsyncClient, url: str, obey_robots: bool) -> bool:
+        if not obey_robots:
+            return True
+        try:
+            p = urlparse(url)
+            key = f"{p.scheme}://{p.netloc}"
+            async with self._lock:
+                rp = self._cache.get(key)
+                if not rp:
+                    robots_url = f"{key}/robots.txt"
+                    try:
+                        r = await client.get(robots_url, timeout=10)
+                        rp = urllib.robotparser.RobotFileParser()
+                        if r.status_code == 200 and r.text:
+                            rp.parse(r.text.splitlines())
+                        else:
+                            rp.parse(["User-agent: *", "Allow: /"])
+                        self._cache[key] = rp
+                    except Exception:
+                        rp = urllib.robotparser.RobotFileParser()
+                        rp.parse(["User-agent: *", "Allow: /"])
+                        self._cache[key] = rp
+            return rp.can_fetch(self.user_agent, url)
+        except Exception:
+            return True
+
+class HostPoliteness:
+    def __init__(self, min_delay: float = 0.75):
+        self.min_delay = max(min_delay, 0.0)
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._last: Dict[str, float] = {}
+    async def wait(self, url: str):
+        host = urlparse(url).netloc
+        lock = self._locks.setdefault(host, asyncio.Lock())
+        async with lock:
+            now = time.monotonic()
+            last = self._last.get(host, 0.0)
+            wait = self.min_delay - (now - last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last[host] = time.monotonic()
+
+
+# -----------------------------
+# Terminal image renderer
+# -----------------------------
+class TerminalImageRenderer:
+    def __init__(self, mode: str = "auto", max_cols: int = 80, max_rows: int = 24):
+        self.mode = mode
+        self.max_cols = max_cols
+        self.max_rows = max_rows
+
+    def detect_mode(self) -> str:
+        if self.mode != "auto":
+            return self.mode
+        term = os.environ.get("TERM", "")
+        if os.environ.get("KITTY_WINDOW_ID") or "xterm-kitty" in term:
+            return "kitty"
+        if os.environ.get("TERM_PROGRAM") == "iTerm.app":
+            return "iterm"
+        return "ascii"
+
+    def render(self, path: str):
+        m = self.detect_mode()
+        try:
+            if m == "kitty":
+                return self._render_kitty(path)
+            if m == "iterm":
+                return self._render_iterm(path)
+            if m == "ascii":
+                return self._render_ascii(path)
+            if m == "none":
+                print(path)
+                return
+        except Exception:
+            pass
+        print(path)
+
+    def _render_iterm(self, path: str, width="auto", height="auto"):
+        bname = os.path.basename(path)
+        with open(path, "rb") as f:
+            data = base64.b64encode(f.read()).decode("ascii")
+        name_b64 = base64.b64encode(bname.encode()).decode("ascii")
+        seq = f"\033]1337;File=name={name_b64};inline=1;width={width};height={height};preserveAspectRatio=1:{data}\a"
+        print(seq)
+
+    def _render_kitty(self, path: str, width=None, height=None):
+        with open(path, "rb") as f:
+            data = base64.b64encode(f.read()).decode("ascii")
+        w = f",s={width}" if width else ""
+        h = f",v={height}" if height else ""
+        CHUNK = 4096
+        for i in range(0, len(data), CHUNK):
+            chunk = data[i:i+CHUNK]
+            more = 1 if (i+CHUNK) < len(data) else 0
+            print(f"\033_Gf=100,a=T{w}{h},m={more};{chunk}\033\\", end="")
+        print()
+
+    def _render_ascii(self, path: str):
+        if not HAVE_PIL:
+            print(path)
+            return
+        img = Image.open(path).convert("RGB")
+        w_target = max(8, self.max_cols)
+        # Height ~ double due to "▀" combining two pixel rows per text row
+        h_target = max(4, int(img.height * (w_target / float(img.width))))
+        img = img.resize((w_target, h_target), Image.BILINEAR)
+        px = img.load()
+        for y in range(0, img.height, 2):
+            line = []
+            for x in range(img.width):
+                top = px[x, y]
+                bottom = px[x, y+1] if y+1 < img.height else top
+                line.append(
+                    f"\x1b[38;2;{top[0]};{top[1]};{top[2]}m\x1b[48;2;{bottom[0]};{bottom[1]};{bottom[2]}m▀"
+                )
+            print("".join(line) + "\x1b[0m")
+
+
+# -----------------------------
+# Actions runner
+# -----------------------------
+def _render_vars(value: Any, vars: Dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        def repl(m):
+            key = m.group(1)
+            return str(vars.get(key, ""))
+        return re.sub(r"\{\{([a-zA-Z0-9_]+)\}\}", repl, value)
+    if isinstance(value, list):
+        return [_render_vars(v, vars) for v in value]
+    if isinstance(value, dict):
+        return {k: _render_vars(v, vars) for k, v in value.items()}
+    return value
+
+def load_actions(path: str) -> List[Dict[str, Any]]:
+    text = ""
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    if HAVE_YAML and (path.endswith(".yaml") or path.endswith(".yml")):
+        return yaml.safe_load(text) or []
+    return json.loads(text)
+
+async def run_actions_on_page(page, actions: List[Dict[str, Any]], vars: Dict[str, Any], http_client: httpx.AsyncClient):
+    for step in actions:
+        t = (step.get("type") or "").lower().strip()
+        s = _render_vars(step, vars)
+        if t == "goto":
+            url = s.get("url")
+            wait_until = s.get("wait_until", "domcontentloaded")
+            await page.goto(url, wait_until=wait_until, timeout=s.get("timeout_ms", 35000))
+        elif t == "click":
+            await page.click(s["selector"], button=s.get("button", "left"), click_count=s.get("count", 1), delay=s.get("delay_ms", 0))
+        elif t == "fill":
+            if s.get("clear", True):
+                await page.fill(s["selector"], "")
+            await page.fill(s["selector"], s.get("text", ""))
+        elif t == "type":
+            if "selector" in s:
+                await page.type(s["selector"], s.get("text", ""), delay=s.get("delay_ms", 50))
+            else:
+                await page.keyboard.type(s.get("text", ""), delay=s.get("delay_ms", 50))
+        elif t == "press":
+            await page.press(s["selector"], s.get("key", "Enter"))
+        elif t == "select":
+            opts = {}
+            for k in ("value", "label", "index"):
+                if k in s:
+                    opts[k] = s[k]
+            await page.select_option(s["selector"], opts)
+        elif t == "check":
+            await page.check(s["selector"])
+        elif t == "uncheck":
+            await page.uncheck(s["selector"])
+        elif t == "wait_for_selector":
+            await page.wait_for_selector(s["selector"], state=s.get("state", "visible"), timeout=s.get("timeout_ms", 20000))
+        elif t == "wait_for_timeout":
+            await page.wait_for_timeout(s.get("ms", s.get("timeout_ms", 1000)))
+        elif t == "wait_for_navigation":
+            await page.wait_for_load_state(s.get("state", "load"), timeout=s.get("timeout_ms", 30000))
+        elif t == "wait_for_url":
+            pattern = s.get("url") or ".*"
+            await page.wait_for_url(pattern, timeout=s.get("timeout_ms", 20000))
+        elif t == "wait_for_load_state":
+            await page.wait_for_load_state(s.get("state", "networkidle"), timeout=s.get("timeout_ms", 30000))
+        elif t == "evaluate":
+            res = await page.evaluate(s.get("script", "(()=>undefined)()"))
+            if "store_as" in s:
+                vars[s["store_as"]] = res
+        elif t == "set_local_storage":
+            items = s.get("items", {})
+            for k, v in items.items():
+                await page.evaluate("""([k, v]) => { localStorage.setItem(k, (typeof v === 'string') ? v : JSON.stringify(v)); }""", [k, v])
+        elif t == "set_cookie":
+            cookie = s.get("cookie", {})
+            if cookie:
+                if "domain" not in cookie:
+                    cur = urlparse(page.url)
+                    cookie["domain"] = cur.hostname
+                if "path" not in cookie:
+                    cookie["path"] = "/"
+                await page.context.add_cookies([cookie])
+        elif t == "upload_files":
+            await page.set_input_files(s["selector"], s.get("files", []))
+        elif t == "http_request":
+            method = (s.get("method") or "GET").upper()
+            url = s.get("url")
+            headers = s.get("headers")
+            data = s.get("data")
+            json_body = s.get("json")
+            params = s.get("params")
+            r = await http_client.request(method, url, headers=headers, data=data, json=json_body, params=params, timeout=30)
+            content_type = r.headers.get("Content-Type", "")
+            val = None
+            try:
+                if "json" in content_type:
+                    val = r.json()
+                else:
+                    val = r.text
+            except Exception:
+                val = r.text
+            if "store_as" in s:
+                vars[s["store_as"]] = val
+        elif t == "screenshot":
+            path = s.get("path")
+            if path:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                await page.screenshot(path=path, full_page=s.get("fullpage", False))
+        else:
+            pass
+
+
+# -----------------------------
+# Extraction helpers (HTML/meta + structured)
+# -----------------------------
+def extract_links_from_html(base_url: str, html_text: str) -> List[str]:
+    try:
+        doc = lxml_html.fromstring(html_text)
+    except Exception:
+        return []
+    hrefs = doc.xpath("//a[@href]/@href")
+    hrefs = [h for h in hrefs if not h.lower().startswith(("javascript:", "mailto:", "tel:", "#"))]
+    return absolutize_links(base_url, hrefs)
+
+def extract_language(doc: lxml_html.HtmlElement) -> Optional[str]:
+    lang = doc.xpath("string(//html/@lang)") or None
+    if lang:
+        return lang.strip()
+    meta_lang = doc.xpath("string(//meta[@http-equiv='content-language']/@content)")
+    return meta_lang.strip() if meta_lang else None
+
+def extract_meta_description(doc: lxml_html.HtmlElement) -> Optional[str]:
+    metas = doc.xpath("//meta[translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='description']/@content")
+    if metas:
+        return metas[0].strip()
+    return None
+
+def extract_title_fallback(doc: lxml_html_html := lxml_html.HtmlElement):
+    pass
+def extract_title_fallback(doc: lxml_html.HtmlElement) -> Optional[str]:
+    t = doc.xpath("string(//title)")
+    return t.strip() if t else None
+
+def extract_canonical(doc: lxml_html.HtmlElement) -> Optional[str]:
+    hrefs = doc.xpath("//link[translate(@rel,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='canonical']/@href")
+    if hrefs:
+        return hrefs[0].strip()
+    return None
+
+def extract_meta_tags(doc: lxml_html.HtmlElement) -> Tuple[Dict[str, str], Dict[str, str]]:
+    og: Dict[str, str] = {}
+    tw: Dict[str, str] = {}
+    for el in doc.xpath("//meta[@property and @content]"):
+        prop = el.get("property", "").strip().lower()
+        if prop.startswith("og:"):
+            og[prop] = el.get("content", "").strip()
+    for el in doc.xpath("//meta[@name and @content]"):
+        name = el.get("name", "").strip().lower()
+        if name.startswith("twitter:"):
+            tw[name] = el.get("content", "").strip()
+    return og, tw
+
+def apply_readability(html_text: str) -> Tuple[Optional[str], Optional[str]]:
+    if not HAVE_READABILITY:
+        return None, None
+    try:
+        doc = Document(html_text)
+        title = (doc.short_title() or "").strip() or None
+        cleaned_html = doc.summary(html_partial=True)
+        if cleaned_html:
+            node = lxml_html.fromstring(cleaned_html)
+            text = node.text_content()
+            text = sanitize_text(text)
+            return title, text
+        return title, None
+    except Exception:
+        return None, None
+
+def strip_boilerplate_fallback(html_text: str) -> str:
+    try:
+        doc = lxml_html.fromstring(html_text)
+        for bad in doc.xpath("//script|//style|//noscript|//header|//nav|//aside|//footer|//form"):
+            parent = bad.getparent()
+            if parent is not None:
+                parent.remove(bad)
+        body = doc.xpath("//body")
+        node = body[0] if body else doc
+        text = node.text_content()
+        return sanitize_text(text)
+    except Exception:
+        return sanitize_text(html_text)
+
+def extract_outline(doc: lxml_html.HtmlElement) -> List[Dict[str, str]]:
+    out = []
+    for level in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+        for el in doc.xpath(f"//{level}"):
+            t = (el.text_content() or "").strip()
+            if t:
+                out.append({"level": level, "text": t})
+    return out
+
+def extract_tables(doc: lxml_html.HtmlElement, max_cells: int = 2000) -> List[List[List[str]]]:
+    tables = []
+    total_cells = 0
+    for tbl in doc.xpath("//table"):
+        rows = []
+        for tr in tbl.xpath(".//tr"):
+            cells = tr.xpath("./th|./td")
+            row = [sanitize_text((c.text_content() or "")) for c in cells]
+            if row:
+                rows.append(row)
+                total_cells += len(row)
+                if total_cells >= max_cells:
+                    break
+        if rows:
+            tables.append(rows)
+        if total_cells >= max_cells:
+            break
+    return tables
+
+def extract_ld_json(doc: lxml_html.HtmlElement) -> List[Dict[str, Any]]:
+    blocks = []
+    for el in doc.xpath("//script[@type='application/ld+json']/text()"):
+        try:
+            data = json.loads(el)
+            if isinstance(data, list):
+                blocks.extend(data)
+            else:
+                blocks.append(data)
+        except Exception:
+            continue
+    return blocks
+
+def extract_code_blocks(doc: lxml_html.HtmlElement, max_blocks: int = 50, max_chars: int = 20000) -> List[str]:
+    blocks = []
+    total = 0
+    for el in doc.xpath("//pre|//code"):
+        t = (el.text_content() or "").strip()
+        if t:
+            t = t[:2000]
+            blocks.append(t)
+            total += len(t)
+            if len(blocks) >= max_blocks or total >= max_chars:
+                break
+    return blocks
+
+def extract_main_content(base_url: str, html_text: str, include_meta: bool = True) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], List[str], Optional[str], Dict[str, str], Dict[str, str]]:
+    title_r, text_r = apply_readability(html_text)
+    doc = None
+    try:
+        doc = lxml_html.fromstring(html_text)
+    except Exception:
+        pass
+    title = title_r or (extract_title_fallback(doc) if doc is not None else None)
+    meta_desc = extract_meta_description(doc) if doc is not None else None
+    lang = extract_language(doc) if doc is not None else None
+    extracted_text = text_r if (text_r and len(text_r.split()) >= 30) else strip_boilerplate_fallback(html_text)
+    links = extract_links_from_html(base_url, html_text)
+    canonical = extract_canonical(doc) if doc is not None else None
+    og, tw = ({}, {})
+    if include_meta and doc is not None:
+        og, tw = extract_meta_tags(doc)
+    return title, meta_desc, lang, extracted_text, links, canonical, og, tw
+
+
+# -----------------------------
+# File extraction (PDF/DOCX/EPUB/TXT)
+# -----------------------------
+def extract_pdf_text(content: bytes) -> Optional[str]:
+    if not HAVE_PDF:
+        return None
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
+            tmp.write(content)
+            tmp.flush()
+            txt = pdf_extract_text(tmp.name) or ""
+        return sanitize_text(txt)
+    except Exception:
+        return None
+
+def extract_docx_text(content: bytes) -> Optional[str]:
+    if not HAVE_DOCX:
+        return None
+    try:
+        d = docx.Document(BytesIO(content))
+        parts = [p.text for p in d.paragraphs if p.text]
+        return sanitize_text("\n\n".join(parts))
+    except Exception:
+        return None
+
+def extract_epub_text(content: bytes) -> Optional[str]:
+    if not HAVE_EPUB:
+        return None
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".epub", delete=True) as tmp:
+            tmp.write(content)
+            tmp.flush()
+            book = epub.read_epub(tmp.name)
+        texts = []
+        for item in book.get_items():
+            if item.get_type() == epub.ITEM_DOCUMENT:
+                try:
+                    node = lxml_html.fromstring(item.get_content())
+                    t = node.text_content()
+                    if t:
+                        texts.append(t)
+                except Exception:
+                    continue
+        return sanitize_text("\n\n".join(texts))
+    except Exception:
+        return None
+
+def extract_text_plain(content: bytes) -> Optional[str]:
+    try:
+        if HAVE_CHARDET:
+            enc = chardet.detect(content).get("encoding") or "utf-8"
+            return sanitize_text(content.decode(enc, errors="replace"))
+        return sanitize_text(content.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Fetcher (HTTP + Playwright)
+# -----------------------------
+class Fetcher:
+    def __init__(
+        self,
+        concurrency: int = 6,
+        user_agent: str = DEFAULT_UA,
+        base_delay: float = 0.5,
+        max_retries: int = 3,
+        obey_robots: bool = True,
+        use_js: bool = False,
+        proxy: Optional[str] = None,
+        screenshot_dir: Optional[str] = None,
+        screenshot_fullpage: bool = False,
+        screenshot_width: Optional[int] = None,
+        screenshot_height: Optional[int] = None,
+        thumbnail_dir: Optional[str] = None,
+        thumbnail_size: int = 360,
+        host_delay: float = 0.75,
+        cookies: Optional[httpx.Cookies] = None,
+        session_profile: Optional[str] = None,
+        headful: bool = False,
+        device: Optional[str] = None,
+        timezone: Optional[str] = None,
+        locale: Optional[str] = None,
+        geolocation: Optional[str] = None,
+        har_dir: Optional[str] = None,
+        trace_dir: Optional[str] = None,
+        downloads_dir: Optional[str] = None,
+    ):
+        self.sem = asyncio.Semaphore(concurrency)
+        self.ua = user_agent
+        self.base_delay = base_delay
+        self.max_retries = max_retries
+        self.obey_robots = obey_robots
+        self.use_js = use_js and HAVE_PLAYWRIGHT
+        self.robots = RobotsCache(user_agent=self.ua)
+        self.screenshot_dir = screenshot_dir
+        self.screenshot_fullpage = screenshot_fullpage
+        self.screenshot_width = screenshot_width
+        self.screenshot_height = screenshot_height
+        self.thumbnail_dir = thumbnail_dir
+        self.thumbnail_size = thumbnail_size
+        self.polite = HostPoliteness(min_delay=host_delay)
+        self._proxy = proxy
+        self._session_profile = session_profile
+        self._headful = headful
+        self._device_name = device
+        self._timezone = timezone
+        self._locale = locale
+        self._geolocation = geolocation
+        self._har_dir = har_dir
+        self._trace_dir = trace_dir
+        self._downloads_dir = downloads_dir
+
+        client_kwargs = dict(
+            http2=True,
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            headers={
+                "User-Agent": self.ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Cache-Control": "no-cache",
+            },
+            follow_redirects=True,
+        )
+        if proxy:
+            client_kwargs["proxies"] = proxy
+        if cookies is not None:
+            client_kwargs["cookies"] = cookies
+
+        self.client = httpx.AsyncClient(**client_kwargs)
+        self._pw = None
+        self._browser = None
+        self._persistent_context = None
+        self._device_profile = None
+
+    async def _ensure_playwright(self):
+        if not self.use_js:
+            return
+        if self._pw is None:
+            self._pw = await async_playwright().start()
+            if self._device_name:
+                try:
+                    self._device_profile = self._pw.devices.get(self._device_name)
+                except Exception:
+                    self._device_profile = None
+            launch_args = dict(headless=(not self._headful))
+            if self._proxy:
+                launch_args["proxy"] = {"server": self._proxy}
+            if self._session_profile:
+                self._persistent_context = await self._pw.chromium.launch_persistent_context(self._session_profile, **launch_args)
+            else:
+                self._browser = await self._pw.chromium.launch(**launch_args)
+
+    async def _new_context(self):
+        opts = dict(user_agent=self.ua, locale=self._locale or "en-US", accept_downloads=True)
+        if self._device_profile:
+            opts.update(self._device_profile)
+        if self._timezone:
+            opts["timezone_id"] = self._timezone
+        if self._downloads_dir:
+            try:
+                os.makedirs(self._downloads_dir, exist_ok=True)
+            except Exception:
+                pass
+        record_har_path = None
+        if self._har_dir and not self._session_profile:
+            os.makedirs(self._har_dir, exist_ok=True)
+            record_har_path = os.path.join(self._har_dir, f"har_{int(time.time()*1000)}.har")
+
+        if self._browser:
+            if record_har_path:
+                ctx = await self._browser.new_context(**opts, record_har_path=record_har_path)
+            else:
+                ctx = await self._browser.new_context(**opts)
+        else:
+            ctx = self._persistent_context
+
+        if self._geolocation:
+            try:
+                lat, lon = [float(x) for x in self._geolocation.split(",")]
+                await ctx.grant_permissions(["geolocation"])
+                await ctx.set_geolocation({"latitude": lat, "longitude": lon})
+            except Exception:
+                pass
+        if self._trace_dir and ctx is not self._persistent_context:
+            os.makedirs(self._trace_dir, exist_ok=True)
+            try:
+                await ctx.tracing.start(screenshots=True, snapshots=True, sources=False)
+            except Exception:
+                pass
+        return ctx
+
+    async def _finalize_context(self, ctx, final_url: str):
+        if self._trace_dir and ctx is not self._persistent_context:
+            try:
+                safe = re.sub(r'[^a-zA-Z0-9._-]+', '_', urlparse(final_url).netloc + "_" + (urlparse(final_url).path.strip("/") or "index"))
+                trace_path = os.path.join(self._trace_dir, f"{safe[:160]}.zip")
+                await ctx.tracing.stop(path=trace_path)
+            except Exception:
+                pass
+        if self._browser and ctx is not self._persistent_context:
+            await ctx.close()
+
+    async def _screenshot(self, page, final_url: str) -> Optional[str]:
+        if not self.screenshot_dir:
+            return None
+        os.makedirs(self.screenshot_dir, exist_ok=True)
+        host = urlparse(final_url).netloc
+        path_part = urlparse(final_url).path.strip("/") or "index"
+        fname = re.sub(r'[^a-zA-Z0-9._-]+', '_', f"{host}_{path_part}")[:180]
+        spath = os.path.join(self.screenshot_dir, f"{fname}.png")
+        try:
+            await page.screenshot(path=spath, full_page=self.screenshot_fullpage)
+            if self.thumbnail_dir and HAVE_PIL:
+                os.makedirs(self.thumbnail_dir, exist_ok=True)
+                tpath = os.path.join(self.thumbnail_dir, f"{fname}_thumb.png")
+                try:
+                    with Image.open(spath) as im:
+                        im.thumbnail((self.thumbnail_size, self.thumbnail_size))
+                        im.save(tpath, "PNG")
+                except Exception:
+                    pass
+            return spath
+        except Exception:
+            return None
+
+    async def close(self):
+        await self.client.aclose()
+        if self._persistent_context:
+            await self._persistent_context.close()
+            self._persistent_context = None
+        if self._browser:
+            await self._browser.close()
+            self._browser = None
+        if self._pw:
+            await self._pw.stop()
+            self._pw = None
+
+    async def fetch_text(
+        self,
+        url: str,
+        actions: Optional[List[Dict[str, Any]]] = None,
+        vars: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str], Optional[str], Optional[bytes], Optional[int], Optional[str], Optional[str]]:
+        """
+        Returns:
+          status_code, final_url, html_text, error, content_type, binary_content, fetch_ms, screenshot_path, canonical_url_js
+        """
+        async with self.sem:
+            try:
+                allowed = await self.robots.can_fetch(self.client, url, self.obey_robots)
+                if not allowed:
+                    return None, None, None, f"Blocked by robots.txt: {url}", None, None, None, None, None
+            except Exception:
+                pass
+
+            await self.polite.wait(url)
+            last_error = None
+            t0 = time.perf_counter()
+            for attempt in range(self.max_retries):
+                try:
+                    if self.use_js or actions:
+                        await self._ensure_playwright()
+                        ctx = await self._new_context()
+                        page = await ctx.new_page()
+                        if self.screenshot_width and self.screenshot_height:
+                            try:
+                                await page.set_viewport_size({"width": self.screenshot_width, "height": self.screenshot_height})
+                            except Exception:
+                                pass
+                        await page.goto(url, wait_until="domcontentloaded", timeout=35000)
+                        await page.wait_for_timeout(300)
+                        if actions:
+                            await run_actions_on_page(page, actions, vars or {}, self.client)
+                        content = await page.content()
+                        final_url = page.url
+                        screenshot_path = await self._screenshot(page, final_url)
+                        canonical_url_js = await page.evaluate("""() => {
+                            const el = document.querySelector('link[rel="canonical"]');
+                            return el ? (el.href || el.getAttribute('href')) : null;
+                        }""")
+                        await asyncio.sleep(self.base_delay)
+                        fetch_ms = int((time.perf_counter() - t0) * 1000)
+                        await self._finalize_context(ctx, final_url)
+                        return 200, final_url, content, None, "text/html", None, fetch_ms, screenshot_path, canonical_url_js
+                    else:
+                        r = await self.client.get(url)
+                        ct = r.headers.get("Content-Type", "")
+                        status = r.status_code
+                        final_url = str(r.url)
+                        if status in (429, 500, 502, 503, 520, 521, 522, 523, 524):
+                            await asyncio.sleep(self.base_delay * (2 ** attempt))
+                            continue
+                        if "text/html" in ct or "application/xhtml+xml" in ct or "xml" in ct:
+                            txt = r.text
+                            bin_content = None
+                        else:
+                            txt = None
+                            bin_content = r.content
+                        await asyncio.sleep(self.base_delay)
+                        fetch_ms = int((time.perf_counter() - t0) * 1000)
+                        return status, final_url, txt, None, ct or None, bin_content, fetch_ms, None, None
+                except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError) as e:
+                    last_error = str(e)
+                    await asyncio.sleep(self.base_delay * (2 ** attempt))
+                except Exception as e:
+                    last_error = str(e)
+                    await asyncio.sleep(self.base_delay * (2 ** attempt))
+            fetch_ms = int((time.perf_counter() - t0) * 1000)
+            return None, None, None, last_error or "Unknown fetch error", None, None, fetch_ms, None, None
+
+
+# -----------------------------
+# Search engines (DDG/Yahoo/Bing/SearXNG)
+# -----------------------------
+async def search_duckduckgo(client: httpx.AsyncClient, query: str, limit: int, user_agent: str) -> List[str]:
+    urls: List[str] = []
+    base = "https://html.duckduckgo.com/html/"
+    params = {"q": query}
+    next_href = None
+    tries = 0
+    while len(urls) < limit and tries < 5:
+        url = f"{base}?{urlencode(params)}" if not next_href else urljoin(base, next_href)
+        r = await client.get(url, headers={"User-Agent": user_agent, "Accept-Language": "en-US,en;q=0.9"}, timeout=20)
+        if r.status_code != 200:
+            break
+        doc = lxml_html.fromstring(r.text)
+        candidates = doc.xpath("//a[contains(@class,'result__a')]/@href")
+        for href in candidates:
+            try:
+                parsed = urlparse(href)
+                if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+                    qs = parse_qs(parsed.query)
+                    real = qs.get("uddg", [])
+                    if real:
+                        link = unquote(real[0])
+                    else:
+                        continue
+                else:
+                    link = href
+                pu = urlparse(link)
+                if pu.scheme in ALLOWED_SCHEMES and link not in urls:
+                    urls.append(link)
+                    if len(urls) >= limit:
+                        break
+            except Exception:
+                continue
+        more = doc.xpath("//a[contains(@class,'result--more__btn')]/@href")
+        next_href = more[0] if more else None
+        if not next_href:
+            break
+        tries += 1
+    return urls[:limit]
+
+async def search_yahoo(client: httpx.AsyncClient, query: str, limit: int, user_agent: str) -> List[str]:
+    searched = 0
+    urls: List[str] = []
+    page = 1
+    while searched < limit and page <= 5:
+        search_url = f"https://search.yahoo.com/search?p={urlencode({'q': query})[2:]}" + (f"&b={(page-1)*10+1}" if page > 1 else "")
+        r = await client.get(search_url, headers={"User-Agent": user_agent, "Accept-Language": "en-US,en;q=0.9"}, timeout=20)
+        if r.status_code != 200:
+            break
+        try:
+            doc = lxml_html.fromstring(r.text)
+            candidates = doc.xpath("//h3//a[@href]/@href")
+            for link in candidates:
+                if link and urlparse(link).scheme in ALLOWED_SCHEMES and link not in urls:
+                    urls.append(link)
+                    searched += 1
+                    if searched >= limit:
+                        break
+        except Exception:
+            break
+        page += 1
+    return urls[:limit]
+
+async def search_bing(client: httpx.AsyncClient, query: str, limit: int, user_agent: str) -> List[str]:
+    urls: List[str] = []
+    page = 0
+    while len(urls) < limit and page < 5:
+        params = {"q": query, "count": 50, "first": page * 50 + 1}
+        r = await client.get("https://www.bing.com/search", params=params, headers={"User-Agent": user_agent}, timeout=20)
+        if r.status_code != 200:
+            break
+        try:
+            doc = lxml_html.fromstring(r.text)
+            candidates = doc.xpath("//li[contains(@class,'b_algo')]//h2/a[@href]/@href")
+            for link in candidates:
+                if urlparse(link).scheme in ALLOWED_SCHEMES and link not in urls:
+                    urls.append(link)
+                    if len(urls) >= limit:
+                        break
+        except Exception:
+            break
+        page += 1
+    return urls[:limit]
+
+async def search_searx(client: httpx.AsyncClient, searx_url: str, query: str, limit: int) -> List[str]:
+    urls: List[str] = []
+    try:
+        params = {"q": query, "format": "json", "categories": "general", "language": "en"}
+        r = await client.get(f"{searx_url.rstrip('/')}/search", params=params, timeout=20)
+        if r.status_code != 200:
+            return urls
+        data = r.json()
+        for item in data.get("results", []):
+            u = item.get("url")
+            if u and urlparse(u).scheme in ALLOWED_SCHEMES and u not in urls:
+                urls.append(u)
+                if len(urls) >= limit:
+                    break
+    except Exception:
+        pass
+    return urls[:limit]
+
+
+# -----------------------------
+# Sitemap ingestion
+# -----------------------------
+async def fetch_sitemap_urls(sitemap_url: str, client: httpx.AsyncClient, limit: int = 500) -> List[str]:
+    urls: List[str] = []
+    seen: Set[str] = set()
+    async def fetch_one(url: str):
+        try:
+            r = await client.get(url, timeout=20)
+            if r.status_code != 200:
+                return
+            doc = lxml_etree.fromstring(r.content)
+            ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+            smaps = doc.findall(".//sm:sitemap/sm:loc", namespaces=ns)
+            if smaps:
+                for loc in smaps:
+                    if len(urls) >= limit: break
+                    u = (loc.text or "").strip()
+                    if u and u not in seen:
+                        seen.add(u)
+                        await fetch_one(u)
+                return
+            locs = doc.findall(".//sm:url/sm:loc", namespaces=ns) or doc.findall(".//url/loc")
+            for loc in locs:
+                if len(urls) >= limit: break
+                u = (loc.text or "").strip()
+                if u and u not in urls:
+                    urls.append(u)
+        except Exception:
+            return
+    await fetch_one(sitemap_url)
+    return urls[:limit]
+
+
+# -----------------------------
+# Orchestrators
+# -----------------------------
+def detect_language_if_needed(text: Optional[str], current: Optional[str], do_detect: bool) -> Optional[str]:
+    if current or not do_detect or not text:
+        return current
+    if not HAVE_LANGDETECT:
+        return current
+    try:
+        return detect(text)
+    except Exception:
+        return current
+
+async def fetch_single_page(
+    fetcher: Fetcher,
+    url: str,
+    include_raw: bool = False,
+    include_meta: bool = True,
+    strip_utm: bool = False,
+    js_fallback_words: int = 0,
+    lang_detect_flag: bool = False,
+    actions: Optional[List[Dict[str, Any]]] = None,
+    vars: Optional[Dict[str, Any]] = None,
+    embed_screenshot: bool = False,
+    include_outline: bool = False,
+    include_tables: bool = False,
+    include_ld: bool = False,
+    include_code: bool = False,
+) -> PageResult:
+    status, final_url, html_text, error, content_type, bin_content, fetch_ms, screenshot_path, canonical_js = await fetcher.fetch_text(url, actions=actions, vars=vars)
+    fetched_at = now_iso()
+    def maybe_strip(u: Optional[str]) -> Optional[str]:
+        return strip_tracking_params(u) if (u and strip_utm) else u
+
+    screenshot_b64 = None
+    if embed_screenshot and screenshot_path and os.path.exists(screenshot_path):
+        try:
+            with open(screenshot_path, "rb") as f:
+                screenshot_b64 = "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+        except Exception:
+            screenshot_b64 = None
+
+    if error or (not html_text and not bin_content):
+        return PageResult(
+            url=maybe_strip(url) or url,
+            final_url=maybe_strip(final_url),
+            ok=False,
+            status=status,
+            title=None,
+            meta_description=None,
+            language=None,
+            extracted_text=None,
+            word_count=None,
+            char_count=None,
+            links=[],
+            error=error or "No content",
+            fetched_at=fetched_at,
+            content_type=content_type,
+            raw_html=html_text if include_raw else None,
+            screenshot_path=screenshot_path,
+            screenshot_b64=screenshot_b64,
+            fetch_ms=fetch_ms,
+            content_hash=None,
+        )
+
+    # HTML
+    if html_text is not None:
+        title, meta_desc, lang, text, links, canonical, og, tw = extract_main_content(final_url or url, html_text, include_meta=include_meta)
+        # JS fallback (only if not already using actions/JS)
+        if (not text or len(text.split()) < js_fallback_words) and js_fallback_words > 0 and HAVE_PLAYWRIGHT and not (fetcher.use_js or actions):
+            tmp_fetcher = Fetcher(concurrency=1, user_agent=fetcher.ua, base_delay=fetcher.base_delay, max_retries=1,
+                                  obey_robots=fetcher.obey_robots, use_js=True, proxy=fetcher._proxy)
+            try:
+                st, fu, h2, err2, ct2, _, ms2, sp2, can2 = await tmp_fetcher.fetch_text(final_url or url)
+                if h2 and not err2:
+                    title, meta_desc, lang2, text2, links2, canonical2, og2, tw2 = extract_main_content(fu or final_url or url, h2, include_meta=include_meta)
+                    if text2 and len(text2.split()) >= (len(text.split()) if text else 0):
+                        html_text = h2; text = text2; links = links2
+                        lang = lang2 or lang; canonical = canonical2 or canonical
+                        og = og2 or og; tw = tw2 or tw; final_url = fu or final_url
+                        screenshot_path = sp2 or screenshot_path; canonical_js = can2 or canonical_js
+                        fetch_ms = (fetch_ms or 0) + (ms2 or 0)
+            finally:
+                await tmp_fetcher.close()
+
+        # Structured extras
+        doc = None
+        try:
+            doc = lxml_html.fromstring(html_text)
+        except Exception:
+            pass
+        outline = extract_outline(doc) if (include_outline and doc is not None) else []
+        tables = extract_tables(doc) if (include_tables and doc is not None) else []
+        ld_blocks = extract_ld_json(doc) if (include_ld and doc is not None) else []
+        codes = extract_code_blocks(doc) if (include_code and doc is not None) else []
+
+        if strip_utm:
+            links = [strip_tracking_params(l) for l in links]
+            canonical = maybe_strip(canonical)
+        canonical_url = canonical_js or canonical
+        lang = detect_language_if_needed(text, lang, lang_detect_flag)
+        wc = len(text.split()) if text else None
+        cc = len(text) if text else None
+        ch = compute_hash(text)
+
+        return PageResult(
+            url=maybe_strip(url) or url, final_url=maybe_strip(final_url),
+            ok=(status == 200 or (fetcher.use_js and status is None) or status in (None, 0)),
+            status=status, title=title, meta_description=meta_desc, language=lang, extracted_text=text,
+            word_count=wc, char_count=cc, links=links, error=None, fetched_at=fetched_at,
+            content_type=content_type or "text/html", canonical_url=canonical_url, og=og, twitter=tw,
+            raw_html=html_text if include_raw else None, screenshot_path=screenshot_path, screenshot_b64=screenshot_b64,
+            fetch_ms=fetch_ms, content_hash=ch, outline=outline, tables=tables, ld_json=ld_blocks, code_blocks=codes,
+        )
+
+    # Non-HTML
+    text = None
+    ct_lower = (content_type or "").lower()
+    if "pdf" in ct_lower:
+        text = extract_pdf_text(bin_content or b"")
+    elif "wordprocessingml" in ct_lower or (final_url or "").endswith(".docx"):
+        text = extract_docx_text(bin_content or b"")
+    elif "epub" in ct_lower or (final_url or "").endswith(".epub"):
+        text = extract_epub_text(bin_content or b"")
+    elif "text/plain" in ct_lower or (final_url or "").endswith(".txt"):
+        text = extract_text_plain(bin_content or b"")
+    else:
+        text = extract_text_plain(bin_content or b"")
+
+    wc = len(text.split()) if text else None
+    cc = len(text) if text else None
+    ch = compute_hash(text)
+    return PageResult(
+        url=maybe_strip(url) or url,
+        final_url=maybe_strip(final_url),
+        ok=(status == 200),
+        status=status,
+        title=None,
+        meta_description=None,
+        language=None,
+        extracted_text=text,
+        word_count=wc,
+        char_count=cc,
+        links=[],
+        error=None if text else "Unsupported non-HTML content",
+        fetched_at=fetched_at,
+        content_type=content_type,
+        raw_html=None,
+        screenshot_path=screenshot_path,
+        screenshot_b64=screenshot_b64,
+        fetch_ms=fetch_ms,
+        content_hash=ch,
+    )
+
+def dedupe_results(results: List[PageResult], mode: str) -> List[PageResult]:
+    if mode == "off":
+        return results
+    seen: Set[str] = set()
+    out: List[PageResult] = []
+    for r in results:
+        if mode == "url":
+            key = (r.final_url or r.url)
+        elif mode == "canonical":
+            key = r.canonical_url or r.final_url or r.url
+        elif mode == "content":
+            key = r.content_hash or (r.extracted_text or "")
+        else:
+            key = (r.final_url or r.url)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+async def search_and_fetch(
+    query: str,
+    engine: str,
+    limit: int,
+    fetcher: Fetcher,
+    include_raw: bool,
+    include_meta: bool,
+    strip_utm: bool,
+    js_fallback_words: int,
+    lang_detect_flag: bool,
+    searx_url: Optional[str] = None,
+    actions: Optional[List[Dict[str, Any]]] = None,
+    vars: Optional[Dict[str, Any]] = None,
+    embed_screenshot: bool = False,
+    include_outline: bool = False,
+    include_tables: bool = False,
+    include_ld: bool = False,
+    include_code: bool = False,
+) -> OutputEnvelope:
+    async with httpx.AsyncClient(http2=True, headers={"User-Agent": fetcher.ua}) as client:
+        if engine.lower() in ("ddg", "duckduckgo"):
+            urls = await search_duckduckgo(client, query, limit, fetcher.ua)
+        elif engine.lower() == "yahoo":
+            urls = await search_yahoo(client, query, limit, fetcher.ua)
+        elif engine.lower() == "bing":
+            urls = await search_bing(client, query, limit, fetcher.ua)
+        elif engine.lower() == "searx":
+            if not searx_url:
+                raise ValueError("SearXNG requires --searx-url")
+            urls = await search_searx(client, searx_url, query, limit)
+        else:
+            raise ValueError("Engine not supported. Use 'ddg', 'yahoo', 'bing', or 'searx'.")
+
+    tasks = [
+        fetch_single_page(fetcher, u, include_raw=include_raw, include_meta=include_meta, strip_utm=strip_utm,
+                          js_fallback_words=js_fallback_words, lang_detect_flag=lang_detect_flag, actions=actions, vars=vars,
+                          embed_screenshot=embed_screenshot, include_outline=include_outline, include_tables=include_tables,
+                          include_ld=include_ld, include_code=include_code)
+        for u in urls
+    ]
+    results = await asyncio.gather(*tasks)
+    return OutputEnvelope(
+        mode="search", engine=engine, query=query, limit=limit, searched_at=now_iso(), results=results
+    )
+
+async def fetch_urls(
+    urls: List[str],
+    fetcher: Fetcher,
+    include_raw: bool,
+    include_meta: bool,
+    strip_utm: bool,
+    js_fallback_words: int,
+    lang_detect_flag: bool,
+    actions: Optional[List[Dict[str, Any]]],
+    vars: Optional[Dict[str, Any]],
+    embed_screenshot: bool,
+    include_outline: bool = False,
+    include_tables: bool = False,
+    include_ld: bool = False,
+    include_code: bool = False,
+) -> OutputEnvelope:
+    tasks = [
+        fetch_single_page(fetcher, u, include_raw=include_raw, include_meta=include_meta, strip_utm=strip_utm,
+                          js_fallback_words=js_fallback_words, lang_detect_flag=lang_detect_flag,
+                          actions=actions, vars=vars, embed_screenshot=embed_screenshot,
+                          include_outline=include_outline, include_tables=include_tables,
+                          include_ld=include_ld, include_code=include_code)
+        for u in urls
+    ]
+    results = await asyncio.gather(*tasks)
+    return OutputEnvelope(mode="urls", engine=None, query=None, limit=len(urls), searched_at=now_iso(), results=results)
+
+async def crawl(
+    start_url: str,
+    fetcher: Fetcher,
+    crawl_depth: int = 1,
+    same_domain: bool = True,
+    max_pages: int = 50,
+    include_raw: bool = False,
+    include_meta: bool = True,
+    strip_utm: bool = False,
+    include_regex: Optional[str] = None,
+    exclude_regex: Optional[str] = None,
+    js_fallback_words: int = 0,
+    lang_detect_flag: bool = False,
+    actions: Optional[List[Dict[str, Any]]] = None,
+    vars: Optional[Dict[str, Any]] = None,
+    embed_screenshot: bool = False,
+    include_outline: bool = False,
+    include_tables: bool = False,
+    include_ld: bool = False,
+    include_code: bool = False,
+) -> OutputEnvelope:
+    visited: Set[str] = set()
+    queue: List[Tuple[str, int]] = [(start_url, 0)]
+    results: List[PageResult] = []
+    include_re = re.compile(include_regex) if include_regex else None
+    exclude_re = re.compile(exclude_regex) if exclude_regex else None
+    while queue and len(results) < max_pages:
+        url, depth = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        res = await fetch_single_page(fetcher, url, include_raw=include_raw, include_meta=include_meta, strip_utm=strip_utm,
+                                      js_fallback_words=js_fallback_words, lang_detect_flag=lang_detect_flag, actions=actions, vars=vars,
+                                      embed_screenshot=embed_screenshot, include_outline=include_outline, include_tables=include_tables,
+                                      include_ld=include_ld, include_code=include_code)
+        results.append(res)
+        if depth < crawl_depth and res.links:
+            for link in res.links:
+                if link in visited:
+                    continue
+                if same_domain and not same_reg_domain(start_url, link):
+                    continue
+                if include_re and not include_re.search(link):
+                    continue
+                if exclude_re and exclude_re.search(link):
+                    continue
+                if len(results) + len(queue) >= max_pages:
+                    break
+                queue.append((link, depth + 1))
+    return OutputEnvelope(mode="crawl", engine=None, query=None, limit=len(results), searched_at=now_iso(), results=results)
+
+async def from_sitemap(
+    sitemap_url: str,
+    fetcher: Fetcher,
+    limit: int,
+    include_raw: bool,
+    include_meta: bool,
+    strip_utm: bool,
+    js_fallback_words: int,
+    lang_detect_flag: bool,
+    actions: Optional[List[Dict[str, Any]]] = None,
+    vars: Optional[Dict[str, Any]] = None,
+    embed_screenshot: bool = False,
+    include_outline: bool = False,
+    include_tables: bool = False,
+    include_ld: bool = False,
+    include_code: bool = False,
+) -> OutputEnvelope:
+    async with httpx.AsyncClient(http2=True, headers={"User-Agent": fetcher.ua}) as client:
+        urls = await fetch_sitemap_urls(sitemap_url, client, limit=limit)
+    return await fetch_urls(urls, fetcher, include_raw, include_meta, strip_utm, js_fallback_words, lang_detect_flag, actions, vars, embed_screenshot, include_outline, include_tables, include_ld, include_code)
+
+
+# -----------------------------
+# JSON output helpers & schema
+# -----------------------------
+def envelope_to_json(env: OutputEnvelope, pretty: bool) -> str:
+    def default(o):
+        if dataclasses.is_dataclass(o):
+            return dataclasses.asdict(o)
+        raise TypeError()
+    if pretty:
+        return json.dumps(env, default=default, indent=2, ensure_ascii=False)
+    return json.dumps(env, default=default, separators=(",", ":"), ensure_ascii=False)
+
+def envelope_to_jsonl(env: OutputEnvelope) -> str:
+    lines = []
+    context = {"mode": env.mode, "engine": env.engine, "query": env.query, "limit": env.limit, "searched_at": env.searched_at}
+    for r in env.results:
+        rec = {"context": context, "page": dataclasses.asdict(r)}
+        lines.append(json.dumps(rec, ensure_ascii=False))
+    return "\n".join(lines)
+
+def get_json_schema() -> Dict:
+    return {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "WebTextExtractorOutput",
+        "type": "object",
+        "properties": {
+            "mode": {"type": "string", "enum": ["search", "urls", "crawl", "sitemap"]},
+            "engine": {"type": ["string", "null"]},
+            "query": {"type": ["string", "null"]},
+            "limit": {"type": ["integer", "null"]},
+            "searched_at": {"type": ["string", "null"], "format": "date-time"},
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "final_url": {"type": ["string", "null"]},
+                        "ok": {"type": "boolean"},
+                        "status": {"type": ["integer", "null"]},
+                        "title": {"type": ["string", "null"]},
+                        "meta_description": {"type": ["string", "null"]},
+                        "language": {"type": ["string", "null"]},
+                        "extracted_text": {"type": ["string", "null"]},
+                        "word_count": {"type": ["integer", "null"]},
+                        "char_count": {"type": ["integer", "null"]},
+                        "links": {"type": "array", "items": {"type": "string"}},
+                        "error": {"type": ["string", "null"]},
+                        "fetched_at": {"type": "string", "format": "date-time"},
+                        "content_type": {"type": ["string", "null"]},
+                        "canonical_url": {"type": ["string", "null"]},
+                        "og": {"type": "object", "additionalProperties": {"type": "string"}},
+                        "twitter": {"type": "object", "additionalProperties": {"type": "string"}},
+                        "raw_html": {"type": ["string", "null"]},
+                        "screenshot_path": {"type": ["string", "null"]},
+                        "screenshot_b64": {"type": ["string", "null"]},
+                        "fetch_ms": {"type": ["integer", "null"]},
+                        "content_hash": {"type": ["string", "null"]},
+                        "outline": {"type": "array", "items": {"type": "object"}},
+                        "tables": {"type": "array", "items": {"type": "array"}},
+                        "ld_json": {"type": "array", "items": {"type": "object"}},
+                        "code_blocks": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["url", "ok", "links, fetched_at"]
+                }
+            }
+        },
+        "required": ["mode", "results"]
+    }
+
+
+# -----------------------------
+# Commands Dictionary
+# -----------------------------
+def build_command_dictionary() -> List[Dict[str, Any]]:
+    return [
+        {"option": "--query", "purpose": "Search query text",
+         "examples": [
+             'web_text_extractor.py --query "site:python.org asyncio" --limit 5 --print titles',
+             'web_text_extractor.py --query "fastapi vs flask" --engine bing --limit 10 --print urls',
+             'web_text_extractor.py --query "best DAG scheduler" --engine searx --searx-url https://searx.be --limit 15 --print table',
+         ]},
+        {"option": "--url", "purpose": "Fetch a single URL",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --print table",
+             "web_text_extractor.py --url https://news.ycombinator.com --js --screenshot-dir shots --print show",
+             "web_text_extractor.py --url https://arxiv.org/pdf/2107.03374.pdf --pretty",
+         ]},
+        {"option": "--urls-file", "purpose": "Fetch URLs from a file (one per line)",
+         "examples": [
+             "web_text_extractor.py --urls-file urls.txt --print summary",
+             "web_text_extractor.py --urls-file urls.txt --format jsonl --output out.jsonl",
+             "web_text_extractor.py --urls-file urls.txt --include-meta --print titles",
+         ]},
+        {"option": "--sitemap", "purpose": "Ingest URLs from a sitemap",
+         "examples": [
+             "web_text_extractor.py --sitemap https://example.com/sitemap.xml --limit 100 --print summary",
+             "web_text_extractor.py --sitemap https://example.com/sitemap.xml --format jsonl --output sm.jsonl",
+             "web_text_extractor.py --sitemap https://docs.python.org/sitemap.xml --limit 50 --print table",
+         ]},
+        {"option": "--engine", "purpose": "Search engine: ddg|yahoo|bing|searx (use --searx-url for SearXNG)",
+         "examples": [
+             "web_text_extractor.py --query 'pydantic tutorial' --engine ddg",
+             "web_text_extractor.py --query 'sqlite backup best practices' --engine bing",
+             "web_text_extractor.py --query 'open source BI tools' --engine searx --searx-url https://searx.be",
+         ]},
+        {"option": "--limit", "purpose": "Number of search/sitemap results to fetch",
+         "examples": [
+             "web_text_extractor.py --query 'asyncio' --limit 5",
+             "web_text_extractor.py --sitemap https://example.com/sitemap.xml --limit 200",
+             "web_text_extractor.py --query 'vector databases' --engine yahoo --limit 20",
+         ]},
+        {"option": "--crawl-depth", "purpose": "Crawl links from the start URL up to depth N",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --crawl-depth 1 --same-domain --print summary",
+             "web_text_extractor.py --url https://docs.example.com --crawl-depth 2 --max-pages 200 --print table",
+             "web_text_extractor.py --url https://blog.example.com --crawl-depth 1 --include-regex 'post|article' --print titles",
+         ]},
+        {"option": "--same-domain", "purpose": "Restrict crawling to the same registered domain",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --crawl-depth 1 --same-domain",
+             "web_text_extractor.py --url https://sub.example.com --crawl-depth 2 --same-domain",
+             "web_text_extractor.py --url https://example.com --crawl-depth 1 --same-domain --max-pages 100",
+         ]},
+        {"option": "--include-regex / --exclude-regex", "purpose": "Include or skip links matching regex",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --crawl-depth 2 --include-regex 'docs|blog'",
+             "web_text_extractor.py --url https://example.com --crawl-depth 2 --exclude-regex 'logout|signup'",
+             "web_text_extractor.py --url https://example.com --crawl-depth 2 --include-regex '202[3-5]' --exclude-regex 'pdf'",
+         ]},
+        {"option": "--concurrency / --host-delay", "purpose": "Parallelism and per-host politeness",
+         "examples": [
+             "web_text_extractor.py --urls-file urls.txt --concurrency 12 --host-delay 1.0",
+             "web_text_extractor.py --url https://example.com --crawl-depth 1 --concurrency 4 --host-delay 2.0",
+             "web_text_extractor.py --query 'site:example.com' --limit 30 --concurrency 10",
+         ]},
+        {"option": "--user-agent / --proxy", "purpose": "Custom UA and HTTP/SOCKS proxy",
+         "examples": [
+             'web_text_extractor.py --url https://httpbin.org/headers --user-agent "MyBot/1.0"',
+             "web_text_extractor.py --url https://example.com --proxy socks5://127.0.0.1:9050",
+             "web_text_extractor.py --query 'open data portals' --proxy http://127.0.0.1:8080",
+         ]},
+        {"option": "--js / --js-fallback", "purpose": "JS rendering via Playwright, or fallback if text too short",
+         "examples": [
+             "web_text_extractor.py --url https://news.ycombinator.com --js --print table",
+             "web_text_extractor.py --url https://example.com/app --js-fallback 100 --print table",
+             "web_text_extractor.py --query 'site:medium.com kafka' --limit 5 --js-fallback 80 --print titles",
+         ]},
+        {"option": "--cookies / --session-profile", "purpose": "Authorized sessions (your cookies or Playwright profile)",
+         "examples": [
+             "web_text_extractor.py --url https://portal.example --cookies cookies.txt --print table",
+             "web_text_extractor.py --url https://portal.example --js --session-profile ./profile --print table",
+             "web_text_extractor.py --url https://portal.example --js --session-profile ./profile --actions-file actions.yaml --vars-file vars.yaml",
+         ]},
+        {"option": "--actions-file / --vars / --vars-file", "purpose": "Run interactive steps before extraction",
+         "examples": [
+             "web_text_extractor.py --url https://example.com/login --js --actions-file actions.yaml --vars-file secrets.yaml",
+             'web_text_extractor.py --url https://example.com/form --js --actions-file actions.json --vars \'{\"q\":\"python\"}\'',
+             "web_text_extractor.py --url https://example.com --js --actions-file actions.yaml --screenshot-dir shots --print show",
+         ]},
+        {"option": "--screenshot-dir / --embed-screenshot", "purpose": "Save screenshots; optionally embed base64 in JSON",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --js --screenshot-dir shots --print shots",
+             "web_text_extractor.py --url https://example.com --js --screenshot-dir shots --embed-screenshot --print output",
+             "web_text_extractor.py --url https://example.com --js --screenshot-dir shots --thumbnail-dir thumbs --print shots",
+         ]},
+        {"option": "--render-image / --print show", "purpose": "Render screenshots in your terminal",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --js --screenshot-dir shots --print show",
+             "web_text_extractor.py --url https://example.com --js --screenshot-dir shots --render-image ascii --render-max-cols 100 --print show",
+             "web_text_extractor.py --url https://example.com --js --screenshot-dir shots --render-image kitty --print show",
+         ]},
+        {"option": "--headful / --device / --timezone / --locale / --geolocation", "purpose": "Debug-visible browser and emulation",
+         "examples": [
+             'web_text_extractor.py --url https://m.example.com --js --device "iPhone 12" --print table',
+             "web_text_extractor.py --url https://example.com --js --headful --timezone Europe/Berlin --locale de-DE",
+             "web_text_extractor.py --url https://maps.example.com --js --geolocation 37.7749,-122.4194",
+         ]},
+        {"option": "--har-dir / --trace-dir / --downloads-dir", "purpose": "Save HAR, Playwright trace zips, and downloads",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --js --har-dir har/ --trace-dir traces/",
+             "web_text_extractor.py --url https://example.com/report --js --downloads-dir downloads/",
+             "web_text_extractor.py --url https://example.com --js --har-dir har/ --print table",
+         ]},
+        {"option": "--include-raw / --include-meta / --strip-utm", "purpose": "Raw HTML, OG/Twitter meta, clean URLs",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --include-raw --print output",
+             "web_text_extractor.py --url https://example.com --include-meta --print titles",
+             "web_text_extractor.py --url https://example.com --strip-utm --print urls",
+         ]},
+        {"option": "--include-outline / --include-tables / --include-ld / --include-code", "purpose": "Structured extras",
+         "examples": [
+             "web_text_extractor.py --url https://blog.example.com --include-outline --print outline",
+             "web_text_extractor.py --url https://docs.example.com --include-tables --print tables",
+             "web_text_extractor.py --url https://shop.example.com --include-ld --print ldjson",
+         ]},
+        {"option": "--dedupe", "purpose": "Deduplication mode: off|url|canonical|content",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --crawl-depth 1 --dedupe canonical",
+             "web_text_extractor.py --urls-file urls.txt --dedupe content --print summary",
+             "web_text_extractor.py --query 'site:example.com' --limit 20 --dedupe url --print titles",
+         ]},
+        {"option": "--lang-detect", "purpose": "Detect language if HTML lang missing",
+         "examples": [
+             "web_text_extractor.py --url https://es.example.com --lang-detect --print table",
+             "web_text_extractor.py --url https://fr.example.com --include-meta --lang-detect",
+             "web_text_extractor.py --sitemap https://example.com/sitemap.xml --lang-detect --print summary",
+         ]},
+        {"option": "--output / --format / --pretty", "purpose": "Write JSON or JSONL to file",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --output out.json --pretty",
+             "web_text_extractor.py --urls-file urls.txt --format jsonl --output out.jsonl",
+             "web_text_extractor.py --query 'python news' --limit 12 --output results.json",
+         ]},
+        {"option": "--print", "purpose": "Console output mode",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --print table",
+             "web_text_extractor.py --query 'pandas tutorial' --limit 5 --print titles",
+             "web_text_extractor.py --url https://example.com --print show --render-image ascii",
+         ]},
+        {"option": "--no-robots", "purpose": "Ignore robots.txt (not recommended)",
+         "examples": [
+             "web_text_extractor.py --url https://example.com --no-robots --print table",
+             "web_text_extractor.py --crawl-depth 1 --no-robots --url https://example.com",
+             "web_text_extractor.py --query 'site:example.com' --limit 5 --no-robots",
+         ]},
+    ]
+
+def print_command_dictionary():
+    rows = build_command_dictionary()
+    print("Commands Dictionary\n")
+    for r in rows:
+        print(f"{r['option']}")
+        print(f"  {r['purpose']}")
+        print("  Examples:")
+        for ex in r["examples"]:
+            print(f"    - {ex}")
+        print()
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+def load_actions_file(path: str) -> List[Dict[str, Any]]:
+    return load_actions(path)
+
+def load_cookies(path: str) -> httpx.Cookies:
+    cookies = httpx.Cookies()
+    try:
+        import http.cookiejar as cookiejar
+        cj = cookiejar.MozillaCookieJar()
+        cj.load(path, ignore_discard=True, ignore_expires=True)
+        for c in cj:
+            cookies.set(c.name, c.value, domain=c.domain, path=c.path or "/")
+        return cookies
+    except Exception:
+        pass
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            for c in data:
+                name = c.get("name"); value = c.get("value"); domain = c.get("domain"); pathv = c.get("path", "/")
+                if name and value:
+                    cookies.set(name, value, domain=domain, path=pathv)
+        return cookies
+    except Exception:
+        return cookies
+
+def load_vars(args) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if args.vars:
+        try:
+            d.update(json.loads(args.vars))
+        except Exception:
+            pass
+    if args.vars_file:
+        try:
+            text = open(args.vars_file, "r", encoding="utf-8").read()
+            if HAVE_YAML and (args.vars_file.endswith(".yaml") or args.vars_file.endswith(".yml")):
+                d.update(yaml.safe_load(text) or {})
+            else:
+                d.update(json.loads(text))
+        except Exception:
+            pass
+    return d
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Website text extractor with search, crawl, actions, screenshots (no paid APIs).")
+
+    # New: print commands dictionary directly and exit
+    p.add_argument("--commands-dict", action="store_true", help="Print the Commands Dictionary and exit")
+
+    g = p.add_mutually_exclusive_group(required=False)
+    g.add_argument("--query", type=str, help="Search query to run via DDG/Yahoo/Bing/SearXNG")
+    g.add_argument("--url", type=str, help="Single URL to fetch")
+    g.add_argument("--urls-file", type=str, help="Path to file containing URLs (one per line)")
+    g.add_argument("--sitemap", type=str, help="Sitemap URL to ingest (sitemap.xml or index)")
+
+    p.add_argument("--engine", type=str, default="ddg", choices=["ddg", "duckduckgo", "yahoo", "bing", "searx"], help="Search engine for --query")
+    p.add_argument("--searx-url", type=str, help="SearXNG instance base URL (required for --engine searx)")
+    p.add_argument("--limit", type=int, default=10, help="Number of search results or sitemap URLs to fetch")
+
+    p.add_argument("--crawl-depth", type=int, default=0, help="Crawl depth when starting from --url or --urls-file (0 disables crawling)")
+    p.add_argument("--same-domain", action="store_true", help="Restrict crawl to the same registered domain")
+    p.add_argument("--max-pages", type=int, default=50, help="Max pages to fetch when crawling")
+    p.add_argument("--include-regex", type=str, help="Only crawl links matching this regex")
+    p.add_argument("--exclude-regex", type=str, help="Skip links matching this regex")
+
+    p.add_argument("--concurrency", type=int, default=6, help="Concurrent fetches")
+    p.add_argument("--host-delay", type=float, default=0.75, help="Minimum delay per host (seconds)")
+    p.add_argument("--user-agent", type=str, default=DEFAULT_UA, help="Custom User-Agent")
+    p.add_argument("--base-delay", type=float, default=0.5, help="Base polite delay between requests (seconds)")
+    p.add_argument("--max-retries", type=int, default=3, help="Max retries for transient errors")
+    p.add_argument("--no-robots", action="store_true", help="Do NOT respect robots.txt (not recommended)")
+    p.add_argument("--js", action="store_true", help="Use JS rendering via Playwright")
+    p.add_argument("--js-fallback", type=int, default=0, help="If extracted words < N, retry via JS (requires Playwright)")
+    p.add_argument("--proxy", type=str, help="HTTP/SOCKS proxy, e.g. http://127.0.0.1:8080 or socks5://127.0.0.1:9050")
+    p.add_argument("--cookies", type=str, help="Load cookies from Netscape/JSON file (authorized sites only)")
+    p.add_argument("--session-profile", type=str, help="Playwright persistent profile dir for login reuse (authorized sites only)")
+
+    p.add_argument("--screenshot-dir", type=str, help="Directory to save screenshots")
+    p.add_argument("--screenshot-fullpage", action="store_true", help="Capture full-page screenshots")
+    p.add_argument("--screenshot-width", type=int, help="Viewport width for screenshots")
+    p.add_argument("--screenshot-height", type=int, help="Viewport height for screenshots")
+    p.add_argument("--thumbnail-dir", type=str, help="Directory to save thumbnails (requires Pillow)")
+    p.add_argument("--thumbnail-size", type=int, default=360, help="Thumbnail size (px)")
+    p.add_argument("--embed-screenshot", action="store_true", help="Embed screenshot base64 in JSON")
+
+    # Terminal rendering
+    p.add_argument("--render-image", type=str, default="auto", choices=["auto", "ascii", "iterm", "kitty", "none"],
+                   help="Render screenshots in terminal (use with --print show)")
+    p.add_argument("--render-max-cols", type=int, default=80, help="Max columns for ASCII render")
+    p.add_argument("--render-max-rows", type=int, default=24, help="Max rows for ASCII render")
+
+    # Playwright extras
+    p.add_argument("--headful", action="store_true", help="Run browser with a visible window (debugging)")
+    p.add_argument("--device", type=str, help='Device emulation, e.g., "iPhone 12"')
+    p.add_argument("--timezone", type=str, help="Timezone ID, e.g., America/Los_Angeles")
+    p.add_argument("--locale", type=str, help="Locale, e.g., en-US")
+    p.add_argument("--geolocation", type=str, help='Set geolocation "LAT,LON" (grants geolocation permission)')
+    p.add_argument("--har-dir", type=str, help="Directory to save HAR files (Playwright)")
+    p.add_argument("--trace-dir", type=str, help="Directory to save Playwright traces (.zip)")
+    p.add_argument("--downloads-dir", type=str, help="Directory for file downloads (best-effort)")
+
+    # Structured extraction toggles
+    p.add_argument("--include-raw", action="store_true", help="Include raw HTML in JSON results")
+    p.add_argument("--include-meta", action="store_true", help="Include OpenGraph/Twitter meta in results")
+    p.add_argument("--strip-utm", action="store_true", help="Strip common tracking params from URLs")
+    p.add_argument("--include-outline", action="store_true", help="Include document outline (H1–H6)")
+    p.add_argument("--include-tables", action="store_true", help="Extract simple HTML tables")
+    p.add_argument("--include-ld", action="store_true", help="Extract JSON-LD blocks")
+    p.add_argument("--include-code", action="store_true", help="Extract code/pre blocks")
+
+    p.add_argument("--dedupe", type=str, default="canonical", choices=["off", "url", "canonical", "content"], help="Deduplication mode")
+    p.add_argument("--lang-detect", action="store_true", help="Detect language if HTML lang is missing (requires langdetect)")
+
+    # Output
+    p.add_argument("--output", type=str, help="Output file path")
+    p.add_argument("--format", type=str, default="json", choices=["json", "jsonl"], help="Output format")
+    p.add_argument("--pretty", action="store_true", help="Pretty-print JSON (for json or console print)")
+
+    p.add_argument("--print", dest="print_mode", type=str, default="auto",
+                   choices=["auto", "output", "json", "urls", "titles", "table", "summary", "errors", "schema", "commands", "shots", "show", "outline", "tables", "ldjson", "none"],
+                   help="Console print mode. 'output' is an alias of 'json'. 'show' renders screenshots in terminal.")
+
+    # Actions
+    p.add_argument("--actions-file", type=str, help="YAML/JSON actions to run in the page")
+    p.add_argument("--vars", type=str, help="Inline JSON variables for actions")
+    p.add_argument("--vars-file", type=str, help="JSON/YAML file with variables for actions")
+
+    return p.parse_args()
+
+def print_console(env: OutputEnvelope, mode: str, pretty: bool, render_mode: str = "auto", render_cols: int = 80, render_rows: int = 24):
+    if mode in ("output", "json"):
+        print(envelope_to_json(env, pretty)); return
+    if mode == "schema":
+        print(json.dumps(get_json_schema(), indent=2)); return
+    if mode == "commands":
+        print_command_dictionary(); return
+    if mode == "urls":
+        for r in env.results: print(r.final_url or r.url); return
+    if mode == "titles":
+        for r in env.results: print(f"{(r.title or '(no title)')}\t{r.final_url or r.url}"); return
+    if mode == "errors":
+        for r in env.results:
+            if r.error or not r.ok: print(f"[{r.status}] {r.final_url or r.url} -> {r.error}")
+        return
+    if mode == "summary":
+        total = len(env.results); ok = sum(1 for r in env.results if r.ok)
+        pdfs = sum(1 for r in env.results if r.content_type and "pdf" in r.content_type.lower())
+        words = sum((r.word_count or 0) for r in env.results)
+        print(f"Results: {total}, OK: {ok}, PDFs: {pdfs}, Total words: {words}"); return
+    if mode == "table":
+        headers = ["#", "Status", "Title", "URL"]; rows = []
+        for i, r in enumerate(env.results, 1):
+            rows.append([str(i), str(r.status or ""), (r.title or "")[:70], (r.final_url or r.url)[:80]])
+        widths = [max(len(h), *(len(row[i]) for row in rows)) for i, h in enumerate(headers)]
+        fmt = " | ".join("{:<" + str(w) + "}" for w in widths); sep = "-+-".join("-"*w for w in widths)
+        print(fmt.format(*headers)); print(sep); [print(fmt.format(*row)) for row in rows]; return
+    if mode == "shots":
+        for r in env.results:
+            if r.screenshot_path: print(f"{r.screenshot_path}\t{r.final_url or r.url}")
+        return
+    if mode == "show":
+        renderer = TerminalImageRenderer(mode=render_mode, max_cols=render_cols, max_rows=render_rows)
+        for r in env.results:
+            if r.screenshot_path:
+                print(f"# {r.title or '(no title)'}")
+                renderer.render(r.screenshot_path)
+                print(r.final_url or r.url)
+        return
+    if mode == "outline":
+        for r in env.results:
+            print(f"== {r.title or '(no title)'} ==")
+            for item in r.outline or []:
+                print(f"{item['level'].upper()}: {item['text']}")
+        return
+    if mode == "tables":
+        for r in env.results:
+            print(f"== {r.title or '(no title)'} ==")
+            for ti, tbl in enumerate(r.tables or [], 1):
+                print(f"[Table {ti}]")
+                for row in tbl:
+                    print(" | ".join(row))
+                print()
+        return
+    if mode == "ldjson":
+        for r in env.results:
+            print(f"== {r.title or '(no title)'} ==")
+            for block in r.ld_json or []:
+                print(json.dumps(block, ensure_ascii=False, indent=2))
+        return
+
+async def main_async():
+    args = parse_args()
+
+    # New: print commands dictionary and exit
+    if args.commands_dict:
+        print_command_dictionary()
+        return
+
+    # If no input source and not printing schema/commands, show help
+    if not any([args.query, args.url, args.urls_file, args.sitemap]):
+        if args.print_mode in ("commands", "schema"):
+            # Allow printing these without a data source
+            if args.print_mode == "commands":
+                print_command_dictionary()
+            else:
+                print(json.dumps(get_json_schema(), indent=2))
+            return
+        # Otherwise, show help
+        print("Error: one of --query/--url/--urls-file/--sitemap is required (or use --commands-dict / --print commands).", file=sys.stderr)
+        sys.exit(2)
+
+    obey_robots = not args.no_robots
+    cookies = load_cookies(args.cookies) if args.cookies else None
+    vars_map = load_vars(args)
+    actions = load_actions(args.actions_file) if args.actions_file else None
+
+    fetcher = Fetcher(
+        concurrency=args.concurrency,
+        user_agent=args.user_agent,
+        base_delay=args.base_delay,
+        max_retries=args.max_retries,
+        obey_robots=obey_robots,
+        use_js=args.js or bool(actions),
+        proxy=args.proxy,
+        screenshot_dir=args.screenshot_dir,
+        screenshot_fullpage=args.screenshot_fullpage,
+        screenshot_width=args.screenshot_width,
+        screenshot_height=args.screenshot_height,
+        thumbnail_dir=args.thumbnail_dir,
+        thumbnail_size=args.thumbnail_size,
+        host_delay=args.host_delay,
+        cookies=cookies,
+        session_profile=args.session_profile,
+        headful=args.headful,
+        device=args.device,
+        timezone=args.timezone,
+        locale=args.locale,
+        geolocation=args.geolocation,
+        har_dir=args.har_dir,
+        trace_dir=args.trace_dir,
+        downloads_dir=args.downloads_dir,
+    )
+
+    try:
+        if args.query:
+            env = await search_and_fetch(
+                args.query, args.engine, args.limit, fetcher,
+                include_raw=args.include_raw, include_meta=args.include_meta, strip_utm=args.strip_utm,
+                js_fallback_words=args.js_fallback, lang_detect_flag=args.lang_detect,
+                searx_url=args.searx_url, actions=actions, vars=vars_map, embed_screenshot=args.embed_screenshot,
+                include_outline=args.include_outline, include_tables=args.include_tables, include_ld=args.include_ld, include_code=args.include_code
+            )
+        elif args.url:
+            if args.crawl_depth > 0:
+                env = await crawl(
+                    start_url=args.url, fetcher=fetcher, crawl_depth=args.crawl_depth, same_domain=args.same_domain,
+                    max_pages=args.max_pages, include_raw=args.include_raw, include_meta=args.include_meta,
+                    strip_utm=args.strip_utm, include_regex=args.include_regex, exclude_regex=args.exclude_regex,
+                    js_fallback_words=args.js_fallback, lang_detect_flag=args.lang_detect, actions=actions, vars=vars_map,
+                    embed_screenshot=args.embed_screenshot, include_outline=args.include_outline, include_tables=args.include_tables,
+                    include_ld=args.include_ld, include_code=args.include_code
+                )
+            else:
+                env = await fetch_urls(
+                    [args.url], fetcher, args.include_raw, args.include_meta, args.strip_utm,
+                    args.js_fallback, args.lang_detect, actions, vars_map, args.embed_screenshot,
+                    args.include_outline, args.include_tables, args.include_ld, args.include_code
+                )
+        elif args.urls_file:
+            urls = [ln.strip() for ln in open(args.urls_file, "r", encoding="utf-8").read().splitlines() if ln.strip()]
+            if args.crawl_depth > 0 and urls:
+                env = await crawl(
+                    start_url=urls[0], fetcher=fetcher, crawl_depth=args.crawl_depth, same_domain=args.same_domain,
+                    max_pages=args.max_pages, include_raw=args.include_raw, include_meta=args.include_meta,
+                    strip_utm=args.strip_utm, include_regex=args.include_regex, exclude_regex=args.exclude_regex,
+                    js_fallback_words=args.js_fallback, lang_detect_flag=args.lang_detect, actions=actions, vars=vars_map,
+                    embed_screenshot=args.embed_screenshot, include_outline=args.include_outline, include_tables=args.include_tables,
+                    include_ld=args.include_ld, include_code=args.include_code
+                )
+            else:
+                env = await fetch_urls(
+                    urls, fetcher, args.include_raw, args.include_meta, args.strip_utm,
+                    args.js_fallback, args.lang_detect, actions, vars_map, args.embed_screenshot,
+                    args.include_outline, args.include_tables, args.include_ld, args.include_code
+                )
+        else:
+            env = await from_sitemap(
+                sitemap_url=args.sitemap, fetcher=fetcher, limit=args.limit,
+                include_raw=args.include_raw, include_meta=args.include_meta, strip_utm=args.strip_utm,
+                js_fallback_words=args.js_fallback, lang_detect_flag=args.lang_detect, actions=actions, vars=vars_map,
+                embed_screenshot=args.embed_screenshot, include_outline=args.include_outline, include_tables=args.include_tables,
+                include_ld=args.include_ld, include_code=args.include_code
+            )
+
+        if args.dedupe != "off":
+            env.results = dedupe_results(env.results, args.dedupe)
+
+        # Write output if requested
+        if args.output:
+            if args.format == "json":
+                js = envelope_to_json(env, args.pretty)
+                with open(args.output, "w", encoding="utf-8") as f:
+                    f.write(js)
+            else:
+                js = envelope_to_jsonl(env)
+                with open(args.output, "w", encoding="utf-8") as f:
+                    f.write(js + "\n")
+            print(f"Wrote {len(env.results)} result(s) to {args.output}")
+
+        # Console print behavior
+        if args.print_mode == "auto":
+            if not args.output:
+                print(envelope_to_json(env, args.pretty))
+        elif args.print_mode != "none":
+            print_console(env, args.print_mode, args.pretty, render_mode=args.render_image, render_cols=args.render_max_cols, render_rows=args.render_max_rows)
+    finally:
+        await fetcher.close()
+
+def main():
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
+
+
+# -----------------------------
+# Python module API (sync/async)
+# -----------------------------
+# Async
+async def a_fetch(url: str, *, js: bool = False, actions: Optional[List[Dict[str, Any]]] = None, vars: Optional[Dict[str, Any]] = None, **kwargs) -> OutputEnvelope:
+    fetcher = Fetcher(use_js=js or bool(actions))
+    try:
+        return await fetch_urls([url], fetcher, kwargs.get("include_raw", False), kwargs.get("include_meta", True),
+                                kwargs.get("strip_utm", False), kwargs.get("js_fallback_words", 0),
+                                kwargs.get("lang_detect_flag", False), actions, vars, kwargs.get("embed_screenshot", False),
+                                kwargs.get("include_outline", False), kwargs.get("include_tables", False),
+                                kwargs.get("include_ld", False), kwargs.get("include_code", False))
+    finally:
+        await fetcher.close()
+
+async def a_search(query: str, limit: int = 10, engine: str = "ddg", **kwargs) -> OutputEnvelope:
+    fetcher = Fetcher(use_js=kwargs.get("js", False))
+    try:
+        return await search_and_fetch(query, engine, limit, fetcher, kwargs.get("include_raw", False),
+                                      kwargs.get("include_meta", True), kwargs.get("strip_utm", False),
+                                      kwargs.get("js_fallback_words", 0), kwargs.get("lang_detect_flag", False),
+                                      kwargs.get("searx_url"), kwargs.get("actions"), kwargs.get("vars"),
+                                      kwargs.get("embed_screenshot", False), kwargs.get("include_outline", False),
+                                      kwargs.get("include_tables", False), kwargs.get("include_ld", False), kwargs.get("include_code", False))
+    finally:
+        await fetcher.close()
+
+async def a_crawl(url: str, depth: int = 1, **kwargs) -> OutputEnvelope:
+    fetcher = Fetcher(use_js=kwargs.get("js", False) or bool(kwargs.get("actions")))
+    try:
+        return await crawl(url, fetcher, crawl_depth=depth, same_domain=kwargs.get("same_domain", True),
+                           max_pages=kwargs.get("max_pages", 50), include_raw=kwargs.get("include_raw", False),
+                           include_meta=kwargs.get("include_meta", True), strip_utm=kwargs.get("strip_utm", False),
+                           include_regex=kwargs.get("include_regex"), exclude_regex=kwargs.get("exclude_regex"),
+                           js_fallback_words=kwargs.get("js_fallback_words", 0), lang_detect_flag=kwargs.get("lang_detect_flag", False),
+                           actions=kwargs.get("actions"), vars=kwargs.get("vars"), embed_screenshot=kwargs.get("embed_screenshot", False),
+                           include_outline=kwargs.get("include_outline", False), include_tables=kwargs.get("include_tables", False),
+                           include_ld=kwargs.get("include_ld", False), include_code=kwargs.get("include_code", False))
+    finally:
+        await fetcher.close()
+
+# Sync wrappers
+def fetch(url: str, **kwargs) -> OutputEnvelope:
+    return asyncio.run(a_fetch(url, **kwargs))
+
+def search(query: str, **kwargs) -> OutputEnvelope:
+    return asyncio.run(a_search(query, **kwargs))
+
+def crawl_site(url: str, **kwargs) -> OutputEnvelope:
+    return asyncio.run(a_crawl(url, **kwargs))
+
+def command_dictionary() -> List[Dict[str, Any]]:
+    return build_command_dictionary()
+
+if __name__ == "__main__":
+    main()
